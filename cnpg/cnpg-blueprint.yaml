@@ -1,0 +1,252 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: cnpg-blueprint
+actions:
+  backup:
+    outputArtifacts:
+      backupInfo:
+        keyValue:
+          namespace: '{{ .Phases.createBackup.Output.namespace }}'
+          clusterName: '{{ .Phases.createBackup.Output.clusterName }}'
+          backupName: '{{ .Phases.createBackup.Output.backupName }}'
+          backupID: '{{ .Phases.checkBackup.Output.backupID }}'
+          objectStoreName: '{{ .Phases.createBackup.Output.objectStoreName }}'
+          serverName: '{{ .Phases.createBackup.Output.serverName }}'
+          database: '{{ .Phases.createBackup.Output.database }}'
+          owner: '{{ .Phases.createBackup.Output.owner }}'
+          clusterSpec: '{{ .Phases.createBackup.Output.clusterSpec }}'
+    phases:
+      # Create an on-demand CNPG Backup that uses the Barman Cloud plugin, and
+      # record what restore needs to rebuild the cluster from the object store.
+      - func: KubeTask
+        name: createBackup
+        args:
+          image: ghcr.io/kanisterio/kanister-kubectl-1.18:0.119.0
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |-
+              ns="{{ .Object.metadata.namespace }}"
+              cluster="{{ .Object.metadata.name }}"
+              plugin="barman-cloud.cloudnative-pg.io"
+              cluster_get() { kubectl get clusters.postgresql.cnpg.io "$cluster" -n "$ns" "$@"; }
+
+              object_store=$(cluster_get -o jsonpath="{.spec.plugins[?(@.name==\"$plugin\")].parameters.barmanObjectName}")
+              if [ -z "$object_store" ]; then
+                  >&2 echo "Cluster $ns/$cluster has no \"$plugin\" entry with a barmanObjectName parameter in spec.plugins. Configure the Barman Cloud plugin on the cluster first."
+                  exit 1
+              fi
+              # The plugin stores backups under the cluster name unless serverName is set
+              server_name=$(cluster_get -o jsonpath="{.spec.plugins[?(@.name==\"$plugin\")].parameters.serverName}")
+              server_name=${server_name:-$cluster}
+              # Same defaults as CNPG: database "app", owner named after the database
+              database=$(cluster_get -o jsonpath="{.spec.bootstrap.*.database}")
+              database=${database:-app}
+              owner=$(cluster_get -o jsonpath="{.spec.bootstrap.*.owner}")
+              owner=${owner:-$database}
+
+              # Keep the cluster spec so restore works even if the source cluster is gone
+              cluster_spec=$(cluster_get -o json \
+                  | kubectl patch --local -f - --type merge -o json \
+                      -p '{"metadata":{"managedFields":null,"annotations":null},"status":null}' \
+                  | base64 -w0)
+
+              backup_name="${cluster}-kanister-$(date -u +%Y%m%d%H%M%S)"
+              kubectl create -f - <<EOF
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Backup
+              metadata:
+                name: $backup_name
+                namespace: $ns
+                labels:
+                  app.kubernetes.io/managed-by: kanister
+              spec:
+                cluster:
+                  name: $cluster
+                method: plugin
+                pluginConfiguration:
+                  name: $plugin
+              EOF
+
+              kando output namespace "$ns"
+              kando output clusterName "$cluster"
+              kando output backupName "$backup_name"
+              kando output objectStoreName "$object_store"
+              kando output serverName "$server_name"
+              kando output database "$database"
+              kando output owner "$owner"
+              kando output clusterSpec "$cluster_spec"
+      # Wait until the backup leaves the pending/running phases. Success is
+      # checked in the next phase, so a failed backup doesn't wait for the timeout.
+      - func: WaitV2
+        name: waitForBackup
+        args:
+          timeout: 45m
+          conditions:
+            anyOf:
+              - condition: '{{ $phase := "" }}{{ if .status }}{{ with .status.phase }}{{ $phase = . }}{{ end }}{{ end }}{{ if or (eq $phase "") (eq $phase "pending") (eq $phase "started") (eq $phase "running") (eq $phase "finalizing") }}false{{ else }}true{{ end }}'
+                objectReference:
+                  apiVersion: v1
+                  group: postgresql.cnpg.io
+                  resource: backups
+                  name: '{{ .Phases.createBackup.Output.backupName }}'
+                  namespace: '{{ .Phases.createBackup.Output.namespace }}'
+      - func: KubeTask
+        name: checkBackup
+        args:
+          image: ghcr.io/kanisterio/kanister-kubectl-1.18:0.119.0
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |-
+              ns="{{ .Phases.createBackup.Output.namespace }}"
+              backup="{{ .Phases.createBackup.Output.backupName }}"
+              backup_get() { kubectl get backups.postgresql.cnpg.io "$backup" -n "$ns" -o jsonpath="$1"; }
+
+              phase=$(backup_get '{.status.phase}')
+              if [ "$phase" != "completed" ]; then
+                  >&2 echo "Backup $ns/$backup ended in phase \"$phase\": $(backup_get '{.status.error}')"
+                  exit 1
+              fi
+              backup_id=$(backup_get '{.status.backupId}')
+              if [ -z "$backup_id" ]; then
+                  >&2 echo "Backup $ns/$backup completed but has no status.backupId"
+                  exit 1
+              fi
+              kando output backupID "$backup_id"
+  restore:
+    inputArtifactNames:
+      - backupInfo
+    phases:
+      # CNPG can't restore in place: create a new cluster from the source
+      # cluster's spec, bootstrapped from the backup in the object store.
+      - func: KubeTask
+        name: createRestoredCluster
+        args:
+          image: ghcr.io/kanisterio/kanister-kubectl-1.18:0.119.0
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |-
+              new_cluster="{{ index .Options "newClusterName" }}"
+              ns="{{ .ArtifactsIn.backupInfo.KeyValue.namespace }}"
+              source_cluster="{{ .ArtifactsIn.backupInfo.KeyValue.clusterName }}"
+              server_name="{{ .ArtifactsIn.backupInfo.KeyValue.serverName }}"
+              plugin="barman-cloud.cloudnative-pg.io"
+
+              if [ -z "$new_cluster" ]; then
+                  >&2 echo 'The "newClusterName" option is required: CNPG restores into a new Cluster. Pass it with "kanctl create actionset ... --options newClusterName=<name>".'
+                  exit 1
+              fi
+              if ! [[ "$new_cluster" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+                  >&2 echo "newClusterName \"$new_cluster\" is not a valid Kubernetes name"
+                  exit 1
+              fi
+              if [ "$new_cluster" = "$source_cluster" ] || [ "$new_cluster" = "$server_name" ]; then
+                  >&2 echo "newClusterName must differ from the backed up cluster \"$source_cluster\" and its serverName \"$server_name\", or the new cluster would archive WAL on top of the backup"
+                  exit 1
+              fi
+              if kubectl get clusters.postgresql.cnpg.io "$new_cluster" -n "$ns" > /dev/null 2>&1; then
+                  >&2 echo "Cluster $ns/$new_cluster already exists. Delete it or choose another newClusterName."
+                  exit 1
+              fi
+
+              echo "{{ .ArtifactsIn.backupInfo.KeyValue.clusterSpec }}" | base64 -d > /tmp/source.json
+              patch() { kubectl patch --local -f - -o json "$@"; }
+
+              # Drop the source's identity, bootstrap method and replica setup
+              patch --type merge -p "$(cat <<EOF
+              {
+                "metadata": {"name": "$new_cluster", "namespace": "$ns", "uid": null, "resourceVersion": null,
+                             "generation": null, "creationTimestamp": null, "selfLink": null,
+                             "finalizers": null, "ownerReferences": null, "labels": null},
+                "spec": {"bootstrap": null, "replica": null, "externalClusters": null}
+              }
+              EOF
+              )" < /tmp/source.json > /tmp/stripped.json
+
+              # Recover exactly the backup taken by Kanister (targetImmediate stops
+              # at the end of the backup instead of replaying all archived WAL)
+              patch --type merge -p "$(cat <<EOF
+              {
+                "spec": {
+                  "bootstrap": {"recovery": {
+                    "source": "kanister-origin",
+                    "database": "{{ .ArtifactsIn.backupInfo.KeyValue.database }}",
+                    "owner": "{{ .ArtifactsIn.backupInfo.KeyValue.owner }}",
+                    "recoveryTarget": {"backupID": "{{ .ArtifactsIn.backupInfo.KeyValue.backupID }}", "targetImmediate": true}
+                  }},
+                  "externalClusters": [{
+                    "name": "kanister-origin",
+                    "plugin": {"name": "$plugin", "parameters": {
+                      "barmanObjectName": "{{ .ArtifactsIn.backupInfo.KeyValue.objectStoreName }}",
+                      "serverName": "$server_name"
+                    }}
+                  }]
+                }
+              }
+              EOF
+              )" < /tmp/stripped.json > /tmp/restored.json
+
+              # Archive the new cluster's WAL under its own name, not the source's
+              json_patch=""
+              i=0
+              for name in $(kubectl patch --local -f /tmp/restored.json --type merge -p '{}' -o jsonpath='{range .spec.plugins[*]}{.name}{" "}{end}'); do
+                  if [ "$name" = "$plugin" ]; then
+                      json_patch="$json_patch,{\"op\":\"add\",\"path\":\"/spec/plugins/$i/parameters/serverName\",\"value\":\"$new_cluster\"}"
+                  fi
+                  i=$((i+1))
+              done
+              if [ -n "$json_patch" ]; then
+                  patch --type json -p "[${json_patch#,}]" < /tmp/restored.json > /tmp/new.json
+              else
+                  cp /tmp/restored.json /tmp/new.json
+              fi
+
+              kubectl create -f /tmp/new.json
+      - func: WaitV2
+        name: waitForClusterReady
+        args:
+          timeout: 45m
+          conditions:
+            anyOf:
+              - condition: '{{ $ready := false }}{{ if .status }}{{ range .status.conditions }}{{ if and (eq .type "Ready") (eq .status "True") }}{{ $ready = true }}{{ end }}{{ end }}{{ end }}{{ $ready }}'
+                objectReference:
+                  apiVersion: v1
+                  group: postgresql.cnpg.io
+                  resource: clusters
+                  name: '{{ index .Options "newClusterName" }}'
+                  namespace: '{{ .ArtifactsIn.backupInfo.KeyValue.namespace }}'
+  delete:
+    inputArtifactNames:
+      - backupInfo
+    phases:
+      # Deleting the Backup resource doesn't remove the data from the object
+      # store. That is governed by the ObjectStore's retentionPolicy.
+      - func: KubeTask
+        name: deleteBackup
+        args:
+          image: ghcr.io/kanisterio/kanister-kubectl-1.18:0.119.0
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |-
+              kubectl delete backups.postgresql.cnpg.io "{{ .ArtifactsIn.backupInfo.KeyValue.backupName }}" \
+                  -n "{{ .ArtifactsIn.backupInfo.KeyValue.namespace }}" --ignore-not-found

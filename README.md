@@ -21,6 +21,7 @@ If you're new to Kanister, we recommend starting with the **[time-log](./time-lo
 
 - **[AWS RDS PostgreSQL](./aws-rds-postgres/aws-rds-postgres-blueprint.yaml)** 
 - **[Cassandra](./cassandra/cassandra-blueprint.yaml)** 
+- **[CloudNativePG](./cnpg/cnpg-blueprint.yaml)** 
 - **[CockroachDB](./cockroachdb/cockroachdb-blueprint.yaml)** 
 - **[CSI Snapshots](./csi-snapshot/csi-snapshot-blueprint.yaml)** 
 - **[Couchbase](./couchbase/couchbase-blueprint.yaml)** 
